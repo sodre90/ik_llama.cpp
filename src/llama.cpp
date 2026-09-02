@@ -2519,6 +2519,42 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched, int step, uint
     return true;
 }
 
+// Claims cells [0, block_start) on behalf of a block some OTHER rank computed, so a rank that starts
+// mid-sequence has somewhere to receive into.
+//
+// The bytes are the lesser half of this. The causal mask, the QSA per-cell block map and n_kv itself
+// are all built from cell POSITIONS before the graph runs, so KV written into cells nobody claimed is
+// masked out and never read -- the rank produces fluent output from its own block alone. Claiming
+// with the right positions is what makes a received block visible at all, and it is also what makes
+// cell i hold position i, which is the only reason a peer can name a cell it has never seen.
+//
+// Recurrent architectures get nothing here, and must not: their carried state is not addressed by
+// cell and does not exist until the rank below has finished that layer, so an ordered relay carries
+// it instead of a reservation standing in for it.
+static bool llama_kv_cache_reserve_external(struct llama_kv_cache & cache, llama_seq_id seq_id, llama_pos block_start) {
+    if (cache.recurrent) {
+        LLAMA_LOG_ERROR("%s: a recurrent cache has no cells to claim\n", __func__);
+        return false;
+    }
+    if (block_start < 0 || (uint32_t) block_start > cache.size) {
+        LLAMA_LOG_ERROR("%s: block_start %d does not fit a cache of %u cells\n",
+                __func__, block_start, cache.size);
+        return false;
+    }
+    for (llama_pos i = 0; i < block_start; i++) {
+        auto & cell = cache.cells[i];
+        if (cell.pos < 0) {
+            cache.used++;
+        }
+        cell.pos   = i;
+        cell.delta = 0;
+        cell.seq_id.clear();
+        cell.seq_id.insert(seq_id);
+    }
+    cache.head = (uint32_t) block_start;
+    return true;
+}
+
 static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     for (int32_t i = 0; i < (int32_t) cache.size; ++i) {
         cache.cells[i].pos = -1;
@@ -10525,6 +10561,43 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
     kv.ckpt.selected_spec_mode = LLAMA_SPEC_CKPT_NONE;
     kv.ckpt.cpu_state_data.clear();
     llama_dsv4_spec_ckpt_discard(ctx);
+}
+
+// Seeds the host-side n-gram history for a sequence whose earlier tokens another rank consumed.
+//
+// This is not cache state and no graph hook can carry it: the n-gram rows are built here, on the
+// host, from the last ple_ngram_size-1 TOKEN IDS, and they index a 320M-row table. A rank that starts
+// mid-sequence has next_pos != pos, falls back to EOS for its first tokens' predecessors, and every
+// tensor-level check still passes -- the divergence first appears at the embedding lookup itself.
+//
+// Takes the LAST ple_ngram_size-1 of whatever it is given, so a caller need not know the n-gram size,
+// and left-pads with the model's PLE EOS when it is given fewer, which is the same segment boundary
+// the builder assumes at the start of a sequence.
+bool llama_ple_history_set(
+        struct llama_context * ctx,
+                llama_seq_id   seq_id,
+         const llama_token   * tokens,
+                     int32_t   n_tokens,
+                   llama_pos   next_pos) {
+    const auto & hp = ctx->model.hparams;
+    const int32_t want = (int32_t) hp.ple_ngram_size - 1;
+    if (want <= 0) {
+        LLAMA_LOG_ERROR("%s: this model has no PLE n-gram embeddings\n", __func__);
+        return false;
+    }
+    if (n_tokens < 0 || (n_tokens > 0 && !tokens)) {
+        return false;
+    }
+    const int32_t take = n_tokens < want ? n_tokens : want;
+    auto & h = ctx->ple_hist[seq_id];
+    h.toks.assign((size_t) (want - take), (llama_token) hp.ple_eos_token_id);
+    h.toks.insert(h.toks.end(), tokens + (n_tokens - take), tokens + n_tokens);
+    h.next_pos = next_pos;
+    return true;
+}
+
+bool llama_kv_cache_reserve_external(struct llama_context * ctx, llama_seq_id seq_id, llama_pos block_start) {
+    return llama_kv_cache_reserve_external(ctx->kv_self, seq_id, block_start);
 }
 
 bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {

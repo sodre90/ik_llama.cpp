@@ -53,10 +53,11 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
     auto V = dst->src[2];
     auto indexer = dst->src[5];
     if (indexer && indexer->type == GGML_TYPE_I32 && indexer->ne[0] < K->ne[1] &&
-        Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 && K->ne[2] == 1) {
+        Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
+        (K->ne[2] == 1 || (Q->ne[1] > 1 && Q->ne[2] % K->ne[2] == 0))) {
         auto row_size_k = ggml_row_size(K->type, K->ne[0]);
         auto row_size_v = ggml_row_size(V->type, V->ne[0]);
-        auto work_size  = (row_size_k + row_size_v + 64) * indexer->ne[0];
+        auto work_size  = (K->ne[2]*(row_size_k + row_size_v) + 64) * (32*((indexer->ne[0] + 31)/32));
         size_t result = work_size * nth;
         if (Q->ne[1]== 1) result += 512*sizeof(float);
         return result;
@@ -164,16 +165,20 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
 
     if (indexer && indexer->type == GGML_TYPE_I32) {
         //if (indexer->ne[0] < nek1 && neq1 >= nth && neq3 == 1 && nek3 == 1 && nev3 == 1 && nek2 == 1) {
-        if (indexer->ne[0] < nek1 && neq3 == 1 && nek3 == 1 && nev3 == 1 && nek2 == 1) {
+        if (indexer->ne[0] < nek1 && neq3 == 1 && nek3 == 1 && nev3 == 1 &&
+            (nek2 == 1 || (neq1 > 1 && neq2 % nek2 == 0))) {
             // Workbuffer: we need
             // * indexer->ne[0] * sizeof(ggml_half) to extract the mask for a row
             // * indexer->ne[0] * ggml_row_size(int_type_k_in, Dk) to extract the selected K cache entries
             // * indexer->ne[0] * ggml_row_size(int_type_v, Dv) to extract the selected V cache entries
             auto row_size_k = ggml_row_size(ggml_type(int_type_k_in), Dk);
             auto row_size_v = ggml_row_size(ggml_type(int_type_v   ), Dv);
-            auto work_size  = (row_size_k + row_size_v + 64) * indexer->ne[0];
             ggml_fp16_t h_inf = ggml_fp32_to_fp16(-INFINITY);
             int  nkv = indexer->ne[0];
+            // The impl consumes cells in blocks of 32, so a plane has to be a whole number of blocks
+            // wide; the cells past the indexer width are masked out rather than left uninitialised.
+            const int nkv_pad = 32*((nkv + 31)/32);
+            auto work_size  = (nek2*(row_size_k + row_size_v) + 64) * nkv_pad;
             if (neq1 == 1) {
                 GGML_ASSERT(neq2 <= 256);
                 int npt = (neq2 + nth - 1)/nth;
@@ -239,25 +244,41 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                     first = ith_mid*npt + (ith - ith_mid)*neq1_this_thread;
                 }
             }
+            const int rk2 = neq2/nek2;
             auto work_k = (char *)work_buffer_in + ith*work_size;
-            auto work_v = work_k + row_size_k*indexer->ne[0];
-            auto work_m = (ggml_fp16_t *)(work_v + row_size_v*indexer->ne[0]);
+            auto work_v = work_k + int64_t(nek2)*row_size_k*nkv_pad;
+            auto work_m = (ggml_fp16_t *)(work_v + int64_t(nek2)*row_size_v*nkv_pad);
+            for (int j = nkv; j < nkv_pad; ++j) {
+                for (int ik02 = 0; ik02 < nek2; ++ik02) {
+                    std::memset(work_k + row_size_k*(int64_t(ik02)*nkv_pad + j), 0, row_size_k);
+                    if (k != v) {
+                        std::memset(work_v + row_size_v*(int64_t(ik02)*nkv_pad + j), 0, row_size_v);
+                    }
+                }
+                work_m[j] = h_inf;
+            }
             for (int iq = first; iq < first + neq1_this_thread; ++iq) {
                 auto idx = (const int *)((const char *)indexer->data + iq*indexer->nb[1]);
-                auto M = (const ggml_fp16_t *)((const char *)mask + iq*stride_m);
+                auto M = (const ggml_fp16_t *)((const char *)mask + int64_t(iq)*stride_m);
                 int last_found = -1;
                 for (int j = 0; j < nkv; ++j) {
                     if (idx[j] >= 0) {
-                        std::memcpy(work_k + row_size_k*j, ((const char *)k + idx[j]*stride_k), row_size_k);
-                        if (k != v) {
-                            std::memcpy(work_v + row_size_v*j, ((const char *)v + idx[j]*stride_v), row_size_v);
+                        for (int ik02 = 0; ik02 < nek2; ++ik02) {
+                            std::memcpy(work_k + row_size_k*(int64_t(ik02)*nkv_pad + j),
+                                    ((const char *)k + idx[j]*stride_k + int64_t(ik02)*nbk2), row_size_k);
+                            if (k != v) {
+                                std::memcpy(work_v + row_size_v*(int64_t(ik02)*nkv_pad + j),
+                                        ((const char *)v + idx[j]*stride_v + int64_t(ik02)*nbv2), row_size_v);
+                            }
                         }
                         work_m[j] = M[idx[j]];
                         last_found = j;
                     } else {
-                        std::memset(work_k + row_size_k*j, 0, row_size_k);
-                        if (k != v) {
-                            std::memset(work_v + row_size_v*j, 0, row_size_v);
+                        for (int ik02 = 0; ik02 < nek2; ++ik02) {
+                            std::memset(work_k + row_size_k*(int64_t(ik02)*nkv_pad + j), 0, row_size_k);
+                            if (k != v) {
+                                std::memset(work_v + row_size_v*(int64_t(ik02)*nkv_pad + j), 0, row_size_v);
+                            }
                         }
                         work_m[j] = h_inf;
                     }
@@ -265,13 +286,18 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 if (last_found < 0) continue;
                 ++last_found;
                 int this_nkv = 32*((last_found + 31)/32);
-                auto this_q = (const char *)q + iq*stride_q;
+                auto this_q = (const char *)q + int64_t(iq)*stride_q;
                 auto this_qkv = qkv + iq*ne1*nb1/sizeof(float);
-                if (!iqk_flash_attn_impl(int_type_k_in, int_type_v,
-                         Dk, Dv, neq2, this_nkv, nbq2, row_size_k, row_size_v, 0, Dv,
-                         (const float *)this_q, work_k, k == v ? work_k : work_v, work_m, (const float *)sinks, 1,
-                         scale, softcap,
-                         this_qkv, nullptr, nullptr)) return false;
+                for (int ik02 = 0; ik02 < nek2; ++ik02) {
+                    auto plane_k = work_k + row_size_k*int64_t(ik02)*nkv_pad;
+                    auto plane_v = k == v ? plane_k : work_v + row_size_v*int64_t(ik02)*nkv_pad;
+                    if (!iqk_flash_attn_impl(int_type_k_in, int_type_v,
+                             Dk, Dv, rk2, this_nkv, nbq2, row_size_k, row_size_v, 0, Dv,
+                             (const float *)(this_q + int64_t(ik02)*rk2*nbq2), plane_k, plane_v, work_m,
+                             sinks ? (const float *)sinks + int64_t(ik02)*rk2 : nullptr, 1,
+                             scale, softcap,
+                             this_qkv + int64_t(ik02)*rk2*(nb1/sizeof(float)), nullptr, nullptr)) return false;
+                }
             }
             return true;
         }
@@ -597,10 +623,10 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 if (this_neq1 > 0) {
                 if (!iqk_flash_attn_impl(int_type_k, int_type_v,
                         Dk, Dv, this_neq1, nek1, stride_q, stride_k, stride_v, stride_m, ne1*nb1/sizeof(float),
-                        (const float *)((const char *)q + iq2*nbq2 + iq3*nbq3 + iq1*stride_q),
+                        (const float *)((const char *)q + iq2*nbq2 + iq3*nbq3 + int64_t(iq1)*stride_q),
                         (const void  *)((const char *)k + iq2/rk2*nbk2 + iq3/rk3*nbk3),
                         (const void  *)((const char *)v + iq2/rv2*nbv2 + iq3/rv3*nbv3),
-                        mask ? (const void  *)((const char *)mask + iq1*stride_m) : nullptr, sinksf, 0,
+                        mask ? (const void  *)((const char *)mask + int64_t(iq1)*stride_m) : nullptr, sinksf, 0,
                         scale, softcap,
                         (float *)((char *)qkv + (iq3*ne2*ne1 + iq2 + iq1*ne1)*nb1), nullptr, nullptr)) return false;
                 }

@@ -289,6 +289,10 @@ struct common_speculative_round_result {
     llama_tokens ids;
 };
 
+
+// Draft size of the most recent round, for callers measuring round cost against batch size.
+int common_speculative_last_n_drafted(const common_speculative * spec);
+
 common_speculative_round_result common_speculative_run_round(
     common_speculative * spec,
     llama_model * model,

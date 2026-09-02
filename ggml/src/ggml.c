@@ -11052,6 +11052,21 @@ void ggml_flash_attn_ext_set_prec(
     ggml_set_op_params_i32(a, 3, prec_i32); // scale is on first pos, max_bias on second
 }
 
+void ggml_flash_attn_ext_add_indexer(
+        struct ggml_tensor * a,
+        struct ggml_tensor * indexer) {
+    if (!indexer) {
+        a->src[5] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL);
+    GGML_ASSERT(indexer->type == GGML_TYPE_I32);
+
+    a->src[5] = indexer;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
@@ -16337,6 +16352,23 @@ static void ggml_compute_forward_sigmoid_f32(
 
     int ith = params->ith;
     int nth = params->nth;
+
+    // a single-row sigmoid (hyper-connection gating at decode) leaves every thread but one with
+    // nothing to do, so stripe element blocks instead, as silu already does
+    if (ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
+        const int k_block_size = 1024;
+        int nelem  = ggml_nelements(src0);
+        int nblock = (nelem + k_block_size - 1)/k_block_size;
+        for (int ib = ith; ib < nblock; ib += nth) {
+            int first = ib*k_block_size;
+            const float * x = (const float *)src0->data + first;
+                  float * y = (      float *) dst->data + first;
+            int nb = first + k_block_size <= nelem ? k_block_size : nelem - first;
+            ggml_vec_sigmoid_f32(nb, y, x);
+        }
+        return;
+    }
+
     int npt = (n + nth - 1)/nth;
     int first = ith*npt;
     int last  = MIN(first + npt, n);
@@ -19943,6 +19975,39 @@ static void ggml_compute_forward_get_rows_q(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // the token and per-layer embedding gathers are one row wide at decode, which strands every
+    // thread but one. dequantize_row_q works in whole blocks, so the column range handed to each
+    // thread is measured in blocks rather than floats
+    const int64_t blck = ggml_blck_size(type);
+
+    if (nr < nth && nc % blck == 0) {
+        const int64_t ts     = ggml_type_size(type);
+        const int64_t nblock = nc/blck;
+        const int64_t db     = (nblock + nth - 1)/nth;
+        const int64_t ib0    = MIN(db*ith, nblock);
+        const int64_t ib1    = MIN(ib0 + db, nblock);
+
+        for (int64_t i = 0; ib1 > ib0 && i < nr; ++i) {
+            const int64_t i12 = i/(ne11*ne10);
+            const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+            const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+            const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+            float * dst_row = (float *) ((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3) + ib0*blck;
+
+            if (i01 < 0 || i01 >= ne01) {
+                memset(dst_row, 0, (ib1 - ib0)*blck*sizeof(float));
+                continue;
+            }
+
+            dequantize_row_q(
+                    (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03 + ib0*ts),
+                    dst_row, (ib1 - ib0)*blck);
+        }
+
+        return;
+    }
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -20067,6 +20132,32 @@ static void ggml_compute_forward_get_rows_f32(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    // a gather narrower than the thread pool leaves most threads with no row to copy, so split
+    // along the row width instead and give each thread a disjoint column range
+    if (nr < nth) {
+        const int64_t dc  = (nc + nth - 1)/nth;
+        const int64_t ic0 = MIN(dc*ith, nc);
+        const int64_t ic1 = MIN(ic0 + dc, nc);
+
+        for (int64_t i = 0; ic1 > ic0 && i < nr; ++i) {
+            const int64_t i12 = i/(ne11*ne10);
+            const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+            const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+            const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+            if (i01 >= 0 && i01 < ne01) {
+                ggml_vec_cpy_f32(ic1 - ic0,
+                        (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3) + ic0,
+                        (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03) + ic0);
+            } else {
+                memset((float *) ((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3) + ic0,
+                       0, (ic1 - ic0)*sizeof(float));
+            }
+        }
+
+        return;
+    }
 
     // rows per thread
     const int dr = (nr + nth - 1)/nth;

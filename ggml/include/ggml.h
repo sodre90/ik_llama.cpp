@@ -2526,6 +2526,14 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_prec       prec);
 
+    // An I32 row of CELL INDICES per query token, negative entries meaning "no cell", read by the
+    // FA kernel from src[5]. When present the kernel gathers only the named cells instead of
+    // sweeping the cache. The mask still decides membership, so an architecture that sets this
+    // passes BOTH -- the indexer says where to look, the mask says what counts.
+    GGML_API void ggml_flash_attn_ext_add_indexer(
+            struct ggml_tensor * a,
+            struct ggml_tensor * indexer);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

@@ -890,6 +890,36 @@ extern "C" {
     // Discard the saved checkpoint and reset internal mode state.
     LLAMA_API void llama_spec_ckpt_discard(struct llama_context * ctx);
 
+    // Seeds the PLE n-gram token history for a sequence whose earlier tokens another rank consumed.
+    //
+    // Companion to llama_kv_cache_reserve_external, and needed for the same reason at a different
+    // layer: the n-gram embedding rows are derived host-side from the preceding TOKEN IDS, not from
+    // any cache, so a split prefill has to hand them over explicitly. Without it a rank's first
+    // tokens get EOS as their predecessors and the model returns a fluent wrong answer.
+    //
+    // Pass the tokens immediately preceding the block, oldest first; only the last ngram_size-1 are
+    // kept and a short list is left-padded with the PLE EOS. next_pos must be the block's first
+    // position, or the builder treats the history as stale and discards it.
+    LLAMA_API bool llama_ple_history_set(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+             const llama_token   * tokens,
+                         int32_t   n_tokens,
+                       llama_pos   next_pos);
+
+    // Claims cells [0, block_start) for a block another rank computed, for sequence-parallel prefill.
+    //
+    // Masks, the QSA block map and n_kv are all derived from cell metadata before the graph runs, so
+    // a rank that merely writes a peer's KV into unclaimed cells has it masked out of every read.
+    // Call this after the context is created and before the first decode of a split prefill.
+    //
+    // Returns false for recurrent caches, which have no cells: their state has to be relayed in
+    // layer order instead, because it does not exist until the rank below has produced it.
+    LLAMA_API bool llama_kv_cache_reserve_external(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   block_start);
+
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
     // seq_id < 0 : match any sequence

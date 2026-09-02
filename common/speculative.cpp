@@ -1665,12 +1665,15 @@ llama_tokens common_speculative_draft(
         break; // We have a draft, so break out of the loop and return it.
     }
 
-    // store draft count for tuner feedback
-    if (spec->tuner && spec->tuner->enabled) {
-        spec->last_n_drafted = (int)result.size();
-    }
+    // Stored unconditionally: the tuner is one consumer, but round-cost instrumentation is another
+    // and it runs with the tuner off.
+    spec->last_n_drafted = (int)result.size();
 
     return result;
+}
+
+int common_speculative_last_n_drafted(const common_speculative * spec) {
+    return spec ? spec->last_n_drafted : 0;
 }
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
