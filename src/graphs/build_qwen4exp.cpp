@@ -3,6 +3,8 @@
 #include "../llama-context.h"
 #include "../llama-delta-net.h"
 
+#include <algorithm>
+#include <cstring>
 #include <optional>
 
 // the [hc_dim] gamma is wider than the per-stream reduction, so ggml_fused_rms_norm cannot
@@ -265,6 +267,20 @@ static ggml_tensor * qwen4exp_ple(
     return ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));
 }
 
+// M0 of the expert-parallel decode plan: an identity custom op dropped at the MoE call site,
+// with no network and no peers, to isolate whether merely installing a graph node there costs
+// anything -- as opposed to sp-prefill.cpp's eval_callback/ask/on_tensor pattern, which is the
+// mechanism already measured to cost ~2x on decode (sp-server.cpp).
+static void qwen4exp_moe_relay_stub(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void *) {
+    const size_t nbytes  = ggml_nbytes(a);
+    const size_t per_task = (nbytes + nth - 1) / nth;
+    const size_t begin = std::min(nbytes, (size_t) ith * per_task);
+    const size_t end   = std::min(nbytes, begin + per_task);
+    if (end > begin) {
+        memcpy((char *) dst->data + begin, (const char *) a->data + begin, end - begin);
+    }
+}
+
 // a query keeps a budget of whole blocks plus the incomplete tail it sits in, where a block is
 // compress_ratio consecutive cells scored through the mean of its members' indexer keys
 static ggml_tensor * qwen4exp_qsa_mask(
@@ -450,7 +466,6 @@ static ggml_tensor * qwen4exp_qsa_mask(
     ggml_tensor * mask = ggml_indexer_mask(ctx0, KQ_mask, top_k);
     cb(mask, "qsa_mask", il);
     *top_k_out = top_k;
-
     return mask;
 }
 
@@ -651,6 +666,19 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
                     mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il, true, false,
                     /* add_input */ false, /* is_norm */ false, /* is_multi */ true,
                     nullptr, -1, 0.0f, nullptr, gathered ? &k_sel : nullptr, gathered ? &v_sel : nullptr);
+
+            // The gather above rewrites K/V into a compacted cell space, so top_k's cache-relative
+            // ids would address the wrong rows there. The two paths are disjoint by construction --
+            // the gather only fires at n_tokens==1, the kernel indexer only helps where neq1>1 --
+            // but they must never be attached to the same flash-attention node.
+            if (top_k && !gathered) {
+                ggml_tensor * fa = nullptr;
+                for (int i = gf->n_nodes - 1; i >= 0 && !fa; --i) {
+                    if (gf->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT) { fa = gf->nodes[i]; }
+                }
+                GGML_ASSERT(fa && "qwen4exp: no flash-attention node to carry the indexer");
+                ggml_flash_attn_ext_add_indexer(fa, top_k);
+            }
         }
 
         res_hc = qwen4exp_hc_combine(ctx0, hparams, res_hc, cur, inject, n_embd, il, cb);
@@ -674,6 +702,14 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
                 LLM_EXPERT_GATING_FUNC_SOFTMAX,
                 LLM_FFN_SILU, cb, il, gf, /* add_input */ false, model.layers[il].ffn_up_gate_exps, nullptr,
                 model.layers[il].ffn_gate_inp_shexp);
+
+        // M0: isolate the cost of merely having a graph node at the MoE output, with no
+        // network and no peers, before any expert-parallel decode protocol exists.
+        static const bool moe_relay_stub = getenv("SP_MOE_RELAY_STUB") != nullptr;
+        if (moe_relay_stub) {
+            cur = ggml_map_custom1(ctx0, cur, qwen4exp_moe_relay_stub, GGML_N_TASKS_MAX, nullptr);
+            cb(cur, "moe_relay_stub", il);
+        }
 
         res_hc = qwen4exp_hc_combine(ctx0, hparams, res_hc, cur, inject, n_embd, il, cb);
         res_hc = lctx.cvec.apply_to(ctx0, res_hc, il);

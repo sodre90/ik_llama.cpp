@@ -410,22 +410,30 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
             }
         }
 
-        // Build required arg sequence in definition order
+        // ARGUMENT ORDER IS THE MODEL'S TO CHOOSE. Sequencing the required arguments ahead of the
+        // optional ones made every other order a rejection of the WHOLE call, and the caller's only
+        // remaining move is to hand the raw markup back as prose -- which ends a coding agent's
+        // session rather than one of its turns. Measured against a real one: read(limit, offset,
+        // path), whose schema declares path first and requires only path, so the model's natural
+        // ordering was exactly the rejected one.
+        //
+        // THIS ALSO RELAXES THE SAMPLING GRAMMAR, which generate_parser builds from this same arena:
+        // a grammar-constrained sampler can now produce a call that omits a required argument, where
+        // before it could not. That is the right trade here, because a parser cannot constrain
+        // anything and its only alternative was rejecting valid calls -- a call missing an argument
+        // reaches the client as a call missing an argument, which it answers with a tool error and
+        // keeps going. A server that leans on the grammar for validity wants a second, strict arena
+        // built for build_grammar rather than this one.
         common_peg_parser args_seq = p.eps();
-        for (size_t i = 0; i < required_parsers.size(); i++) {
-            if (i > 0) {
-                args_seq = args_seq + p.space();
+        if (!required_parsers.empty() || !optional_parsers.empty()) {
+            common_peg_parser any_arg = p.choice();
+            for (const auto & arg : required_parsers) {
+                any_arg |= arg;
             }
-            args_seq = args_seq + required_parsers[i];
-        }
-
-        // Build optional args with flexible ordering
-        if (!optional_parsers.empty()) {
-            common_peg_parser any_opt = p.choice();
-            for (const auto & opt : optional_parsers) {
-                any_opt |= opt;
+            for (const auto & arg : optional_parsers) {
+                any_arg |= arg;
             }
-            args_seq = args_seq + p.repeat(p.space() + any_opt, 0, -1);
+            args_seq = p.repeat(p.space() + any_arg, 0, -1);
         }
 
         if (!arguments.start.empty()) {
