@@ -1842,6 +1842,28 @@ inline float hmin_f32_8(__m256 x) {
 // In micro-benchmark testing this code outperforms std::partial_sort by a factor of 4-6
 // (factors, not percentages!).
 // For DS4 running CPU-only this translates into a 3% better TG at a context of 128k tokens.
+// Checks the exact top-k property rather than the chosen indices: with thr the smallest selected
+// score, every score in the array strictly above thr has to be part of the selection. The indexer
+// emits exact duplicate scores, so which of several tied cells at thr gets kept is ambiguous and
+// index equality is not a usable criterion.
+inline void iqk_topk_verify(int ntop, const float * values, const int * idx, int ngood) {
+    static const bool enabled = getenv("SP_TOPK_VERIFY") != nullptr;
+    if (!enabled) return;
+    float thr = INFINITY;
+    for (int j = 0; j < ntop; ++j) thr = std::min(thr, values[idx[j]]);
+    int n_selected_above = 0;
+    for (int j = 0; j < ntop; ++j) n_selected_above += values[idx[j]] > thr;
+    int n_above = 0;
+    for (int j = 0; j < ngood; ++j) n_above += values[j] > thr;
+    static int64_t checked = 0, failed = 0;
+    if (n_above != n_selected_above) ++failed;
+    if (++checked % 512 == 0) {
+        fprintf(stderr, "TOPK_VERIFY checked %lld  failed %lld  (last: ntop %d ngood %d thr %g"
+                " above %d selected_above %d)\n",
+                (long long) checked, (long long) failed, ntop, ngood, thr, n_above, n_selected_above);
+    }
+}
+
 void iqk_bucket_topk(int nval, int ntop, float * values, int * idx, int * idx_inf, int nbucket, int * counts,
         int * idx_aux) {
 #if 0
@@ -1941,14 +1963,58 @@ void iqk_bucket_topk(int nval, int ntop, float * values, int * idx, int * idx_in
         if (sum >= ntop) break;
     }
     int nhave = 0, nlast = 0;
+    float cut_max = -INFINITY, cut_min = INFINITY;
     for (int j = 0; j < ngood; ++j) {
         if (idx_aux[j] < last_bucket) {
             idx[nhave++] = idx[j];
         } else if (idx_aux[j] == last_bucket) {
             idx_inf[nlast++] = idx[j];
+            cut_max = std::max(cut_max, values[j]);
+            cut_min = std::min(cut_min, values[j]);
         }
     }
     int n_extra = ntop - nhave;
+    // A single linear pass of nbucket buckets leaves about three quarters of this model's indexer
+    // scores inside the cut bucket, which made the selection below cost more than the three passes
+    // above it put together. Re-bucketing only the cut bucket costs one more pass over it and
+    // divides the candidates that still have to be ranked by roughly nbucket per round.
+    while (n_extra > 0 && nlast > 4*n_extra && cut_max - cut_min >= 1e-6f) {
+        // Bucketing the offset from cut_max rather than the raw score matters here in a way it does
+        // not in the pass above: each round shrinks the range by about nbucket, so an av*v + bv form
+        // would subtract two numbers that agree to within a float ulp and hand back bucket indices
+        // off by several -- including negative ones, which land outside counts[]. The subtraction is
+        // exact for values this close together, and the clamp keeps a denormal range harmless.
+        const float av_cut = (nbucket - 0.75f)/(cut_min - cut_max);
+        for (int i = 0; i < nbucket; ++i) counts[i] = 0;
+        for (int t = 0; t < nlast; ++t) {
+            int i = int(av_cut*(values[idx_inf[t]] - cut_max));
+            i = std::max(0, std::min(i, nbucket-1));
+            idx_aux[t] = i;
+            ++counts[i];
+        }
+        int cut_bucket = 0, cut_sum = 0;
+        for (; cut_bucket < nbucket-1; ++cut_bucket) {
+            cut_sum += counts[cut_bucket];
+            if (cut_sum >= n_extra) break;
+        }
+        int n_kept = 0;
+        float next_max = -INFINITY, next_min = INFINITY;
+        for (int t = 0; t < nlast; ++t) {
+            const int id = idx_inf[t];
+            if (idx_aux[t] < cut_bucket) {
+                idx[nhave++] = id;
+            } else if (idx_aux[t] == cut_bucket) {
+                idx_inf[n_kept++] = id;
+                next_max = std::max(next_max, values[id]);
+                next_min = std::min(next_min, values[id]);
+            }
+        }
+        if (n_kept == nlast) break; // every candidate fell in one bucket again, so this is not converging
+        nlast = n_kept;
+        n_extra = ntop - nhave;
+        cut_max = next_max;
+        cut_min = next_min;
+    }
     auto compare = [values] (int l, int r) {
         return values[l] > values[r];
     };
@@ -1958,6 +2024,7 @@ void iqk_bucket_topk(int nval, int ntop, float * values, int * idx, int * idx_in
         std::sort(idx_inf, idx_inf + nlast, compare);
     }
     for (int j = 0; j < n_extra; ++j) idx[nhave + j] = idx_inf[j];
+    iqk_topk_verify(ntop, values, idx, ngood);
 }
 #ifdef __AVX2__
 inline void iqk_repack_f16(int nrows, int n_per_row, const char * k_in, size_t nb, float * k_out) {
