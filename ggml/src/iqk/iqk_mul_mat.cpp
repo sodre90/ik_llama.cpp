@@ -1846,26 +1846,54 @@ inline float hmin_f32_8(__m256 x) {
 // score, every score in the array strictly above thr has to be part of the selection. The indexer
 // emits exact duplicate scores, so which of several tied cells at thr gets kept is ambiguous and
 // index equality is not a usable criterion.
-inline void iqk_topk_verify(int ntop, const float * values, const int * idx, int ngood) {
+inline bool iqk_topk_verify_enabled() {
     static const bool enabled = getenv("SP_TOPK_VERIFY") != nullptr;
-    if (!enabled) return;
-    float thr = INFINITY;
-    for (int j = 0; j < ntop; ++j) thr = std::min(thr, values[idx[j]]);
-    int n_selected_above = 0;
-    for (int j = 0; j < ntop; ++j) n_selected_above += values[idx[j]] > thr;
-    int n_above = 0;
-    for (int j = 0; j < ngood; ++j) n_above += values[j] > thr;
-    static int64_t checked = 0, failed = 0;
-    if (n_above != n_selected_above) ++failed;
+    return enabled;
+}
+
+// -inf confined to the end of the array is the case where compacting the finite scores leaves every
+// one of them at its own cell index. Anywhere else and the two stop agreeing, which is the whole
+// reason the ranking below carries scores rather than looking them up by cell.
+inline bool iqk_topk_inf_is_interior(int nval, const float * values) {
+    int last_finite = -1;
+    for (int j = 0; j < nval; ++j) {
+        if (values[j] > -INFINITY) last_finite = j;
+    }
+    for (int j = 0; j < last_finite; ++j) {
+        if (!(values[j] > -INFINITY)) return true;
+    }
+    return false;
+}
+
+// Compares the chosen scores against a reference top-k as a multiset. Checking which cells were
+// chosen would report ties as failures, and checking values[] after the call would read slots the
+// two compaction passes have since reused. The worst deviation separates a real mis-selection from
+// the deliberate shortcut the kernel takes when the whole range is narrower than 1e-6.
+inline void iqk_topk_verify(int nval, int ntop, const float * pristine, const int * idx) {
+    std::vector<float> chosen(ntop);
+    for (int j = 0; j < ntop; ++j) chosen[j] = pristine[idx[j]];
+    std::vector<float> reference(pristine, pristine + nval);
+    std::partial_sort(reference.begin(), reference.begin() + ntop, reference.end(), std::greater<float>());
+    std::sort(chosen.begin(), chosen.end(), std::greater<float>());
+    float worst = 0;
+    for (int j = 0; j < ntop; ++j) {
+        float d = chosen[j] - reference[j];
+        worst = std::max(worst, d < 0 ? -d : d);
+    }
+    static int64_t checked = 0, failed = 0, interior = 0;
+    static float worst_seen = 0;
+    if (worst > 0) ++failed;
+    worst_seen = std::max(worst_seen, worst);
+    if (iqk_topk_inf_is_interior(nval, pristine)) ++interior;
     if (++checked % 512 == 0) {
-        fprintf(stderr, "TOPK_VERIFY checked %lld  failed %lld  (last: ntop %d ngood %d thr %g"
-                " above %d selected_above %d)\n",
-                (long long) checked, (long long) failed, ntop, ngood, thr, n_above, n_selected_above);
+        fprintf(stderr, "TOPK_VERIFY checked %lld  failed %lld  interior_inf %lld  worst_dev %g"
+                "  (last: nval %d ntop %d)\n",
+                (long long) checked, (long long) failed, (long long) interior, worst_seen, nval, ntop);
     }
 }
 
-void iqk_bucket_topk(int nval, int ntop, float * values, int * idx, int * idx_inf, int nbucket, int * counts,
-        int * idx_aux) {
+static void iqk_bucket_topk_impl(int nval, int ntop, float * values, int * idx, int * idx_inf, int nbucket,
+        int * counts, int * idx_aux) {
 #if 0
     int ngood = nval;
     while (ngood > 0 && values[ngood-1] == -INFINITY) --ngood;
@@ -1968,9 +1996,11 @@ void iqk_bucket_topk(int nval, int ntop, float * values, int * idx, int * idx_in
         if (idx_aux[j] < last_bucket) {
             idx[nhave++] = idx[j];
         } else if (idx_aux[j] == last_bucket) {
+            const float v = values[j];
+            values[nlast]    = v;
             idx_inf[nlast++] = idx[j];
-            cut_max = std::max(cut_max, values[j]);
-            cut_min = std::min(cut_min, values[j]);
+            cut_max = std::max(cut_max, v);
+            cut_min = std::min(cut_min, v);
         }
     }
     int n_extra = ntop - nhave;
@@ -1987,7 +2017,7 @@ void iqk_bucket_topk(int nval, int ntop, float * values, int * idx, int * idx_in
         const float av_cut = (nbucket - 0.75f)/(cut_min - cut_max);
         for (int i = 0; i < nbucket; ++i) counts[i] = 0;
         for (int t = 0; t < nlast; ++t) {
-            int i = int(av_cut*(values[idx_inf[t]] - cut_max));
+            int i = int(av_cut*(values[t] - cut_max));
             i = std::max(0, std::min(i, nbucket-1));
             idx_aux[t] = i;
             ++counts[i];
@@ -2004,9 +2034,11 @@ void iqk_bucket_topk(int nval, int ntop, float * values, int * idx, int * idx_in
             if (idx_aux[t] < cut_bucket) {
                 idx[nhave++] = id;
             } else if (idx_aux[t] == cut_bucket) {
+                const float v = values[t];
+                values[n_kept]    = v;
                 idx_inf[n_kept++] = id;
-                next_max = std::max(next_max, values[id]);
-                next_min = std::min(next_min, values[id]);
+                next_max = std::max(next_max, v);
+                next_min = std::min(next_min, v);
             }
         }
         if (n_kept == nlast) break; // every candidate fell in one bucket again, so this is not converging
@@ -2018,13 +2050,27 @@ void iqk_bucket_topk(int nval, int ntop, float * values, int * idx, int * idx_in
     auto compare = [values] (int l, int r) {
         return values[l] > values[r];
     };
+    for (int t = 0; t < nlast; ++t) idx_aux[t] = t;
     if (2*n_extra < nlast) {
-        std::partial_sort(idx_inf, idx_inf + n_extra, idx_inf + nlast, compare);
+        std::partial_sort(idx_aux, idx_aux + n_extra, idx_aux + nlast, compare);
     } else {
-        std::sort(idx_inf, idx_inf + nlast, compare);
+        std::sort(idx_aux, idx_aux + nlast, compare);
     }
-    for (int j = 0; j < n_extra; ++j) idx[nhave + j] = idx_inf[j];
-    iqk_topk_verify(ntop, values, idx, ngood);
+    for (int j = 0; j < n_extra; ++j) idx[nhave + j] = idx_inf[idx_aux[j]];
+}
+
+// The kernel overwrites values[] as it goes and returns from three different places, so the check
+// takes its copy here and runs once on the way out rather than at each of them.
+void iqk_bucket_topk(int nval, int ntop, float * values, int * idx, int * idx_inf, int nbucket, int * counts,
+        int * idx_aux) {
+    if (!iqk_topk_verify_enabled()) {
+        iqk_bucket_topk_impl(nval, ntop, values, idx, idx_inf, nbucket, counts, idx_aux);
+        return;
+    }
+    static thread_local std::vector<float> pristine;
+    pristine.assign(values, values + nval);
+    iqk_bucket_topk_impl(nval, ntop, values, idx, idx_inf, nbucket, counts, idx_aux);
+    iqk_topk_verify(nval, ntop, pristine.data(), idx);
 }
 #ifdef __AVX2__
 inline void iqk_repack_f16(int nrows, int n_per_row, const char * k_in, size_t nb, float * k_out) {
