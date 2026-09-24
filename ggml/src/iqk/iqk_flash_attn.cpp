@@ -60,6 +60,11 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
         auto work_size  = (K->ne[2]*(row_size_k + row_size_v) + 64) * (32*((indexer->ne[0] + 31)/32));
         size_t result = work_size * nth;
         if (Q->ne[1]== 1) result += 512*sizeof(float);
+        if (Q->ne[1] > 1 && Q->ne[1] < nth) {
+            size_t head_split = (size_t)(2*K->ne[2]*(row_size_k + row_size_v) + 2*nth)
+                              * (32*((indexer->ne[0] + 31)/32));
+            if (head_split > result) result = head_split;
+        }
         return result;
         //return work_size * nth;
     }
@@ -230,6 +235,64 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                          (const float *)this_q, work_k, k == v ? work_k : work_v, work_m, sinks ? (const float *)sinks + first : nullptr, 1,
                          scale, softcap,
                          this_qkv, nullptr, nullptr)) return false;
+                return true;
+            }
+            if (neq1 < nth && barrier) {
+                const int rk2_head = neq2/nek2;
+                const int64_t plane_bytes = int64_t(nek2)*(row_size_k + row_size_v)*nkv_pad;
+                auto gather_base = (char *)work_buffer_in;
+                auto work_m = (ggml_fp16_t *)(gather_base + 2*plane_bytes) + nkv_pad*ith;
+                const int head_lo = (int)((int64_t)ith*neq2/nth);
+                const int head_hi = (int)((int64_t)(ith + 1)*neq2/nth);
+                for (int iq = 0; iq < neq1; ++iq) {
+                    auto work_k = gather_base + (iq % 2)*plane_bytes;
+                    auto work_v = work_k + int64_t(nek2)*row_size_k*nkv_pad;
+                    auto idx = (const int *)((const char *)indexer->data + iq*indexer->nb[1]);
+                    auto M = (const ggml_fp16_t *)((const char *)mask + int64_t(iq)*stride_m);
+                    int last_found = -1;
+                    for (int j = 0; j < nkv_pad; ++j) {
+                        const bool selected = j < nkv && idx[j] >= 0;
+                        if (j % nth == ith) {
+                            for (int ik02 = 0; ik02 < nek2; ++ik02) {
+                                auto this_k = work_k + row_size_k*(int64_t(ik02)*nkv_pad + j);
+                                if (selected) {
+                                    std::memcpy(this_k, ((const char *)k + idx[j]*stride_k + int64_t(ik02)*nbk2), row_size_k);
+                                    if (k != v) {
+                                        std::memcpy(work_v + row_size_v*(int64_t(ik02)*nkv_pad + j),
+                                                ((const char *)v + idx[j]*stride_v + int64_t(ik02)*nbv2), row_size_v);
+                                    }
+                                } else {
+                                    std::memset(this_k, 0, row_size_k);
+                                    if (k != v) {
+                                        std::memset(work_v + row_size_v*(int64_t(ik02)*nkv_pad + j), 0, row_size_v);
+                                    }
+                                }
+                            }
+                        }
+                        work_m[j] = selected ? M[idx[j]] : h_inf;
+                        if (selected) last_found = j;
+                    }
+                    barrier(barrier_data);
+                    if (last_found < 0) continue;
+                    ++last_found;
+                    int this_nkv = 32*((last_found + 31)/32);
+                    auto this_q = (const char *)q + int64_t(iq)*stride_q;
+                    auto this_qkv = qkv + iq*ne1*nb1/sizeof(float);
+                    int head = head_lo;
+                    while (head < head_hi) {
+                        const int ik02 = head/rk2_head;
+                        const int n_rows = head_hi < (ik02 + 1)*rk2_head ? head_hi - head : (ik02 + 1)*rk2_head - head;
+                        auto plane_k = work_k + row_size_k*int64_t(ik02)*nkv_pad;
+                        auto plane_v = k == v ? plane_k : work_v + row_size_v*int64_t(ik02)*nkv_pad;
+                        if (!iqk_flash_attn_impl(int_type_k_in, int_type_v,
+                                 Dk, Dv, n_rows, this_nkv, nbq2, row_size_k, row_size_v, 0, Dv,
+                                 (const float *)(this_q + int64_t(head)*nbq2), plane_k, plane_v, work_m,
+                                 sinks ? (const float *)sinks + head : nullptr, 1,
+                                 scale, softcap,
+                                 this_qkv + int64_t(head)*(nb1/sizeof(float)), nullptr, nullptr)) return false;
+                        head += n_rows;
+                    }
+                }
                 return true;
             }
             int npt = (neq1 + nth - 1)/nth;
