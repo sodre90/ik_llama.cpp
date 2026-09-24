@@ -10567,12 +10567,14 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
 //
 // This is not cache state and no graph hook can carry it: the n-gram rows are built here, on the
 // host, from the last ple_ngram_size-1 TOKEN IDS, and they index a 320M-row table. A rank that starts
-// mid-sequence has next_pos != pos, falls back to EOS for its first tokens' predecessors, and every
-// tensor-level check still passes -- the divergence first appears at the embedding lookup itself.
+// mid-sequence has no tokens stored at the positions before its first one, reads EOS for those
+// predecessors, and every tensor-level check still passes -- the divergence first appears at the
+// embedding lookup itself.
 //
 // Takes the LAST ple_ngram_size-1 of whatever it is given, so a caller need not know the n-gram size,
 // and left-pads with the model's PLE EOS when it is given fewer, which is the same segment boundary
-// the builder assumes at the start of a sequence.
+// the builder assumes at the start of a sequence. The history is indexed by position, so the tokens
+// land at the positions immediately before next_pos and everything earlier reads as EOS.
 bool llama_ple_history_set(
         struct llama_context * ctx,
                 llama_seq_id   seq_id,
@@ -10588,11 +10590,13 @@ bool llama_ple_history_set(
     if (n_tokens < 0 || (n_tokens > 0 && !tokens)) {
         return false;
     }
-    const int32_t take = n_tokens < want ? n_tokens : want;
+    if (next_pos < 0) {
+        return false;
+    }
+    const int32_t take = std::min({n_tokens, want, (int32_t) next_pos});
     auto & h = ctx->ple_hist[seq_id];
-    h.toks.assign((size_t) (want - take), (llama_token) hp.ple_eos_token_id);
-    h.toks.insert(h.toks.end(), tokens + (n_tokens - take), tokens + n_tokens);
-    h.next_pos = next_pos;
+    h.assign((size_t) next_pos, (llama_token) hp.ple_eos_token_id);
+    std::copy(tokens + (n_tokens - take), tokens + n_tokens, h.end() - take);
     return true;
 }
 

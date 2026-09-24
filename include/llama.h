@@ -899,7 +899,7 @@ extern "C" {
     //
     // Pass the tokens immediately preceding the block, oldest first; only the last ngram_size-1 are
     // kept and a short list is left-padded with the PLE EOS. next_pos must be the block's first
-    // position, or the builder treats the history as stale and discards it.
+    // position: the tokens are stored at the positions immediately before it.
     LLAMA_API bool llama_ple_history_set(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,
