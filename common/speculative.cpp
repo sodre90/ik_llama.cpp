@@ -2056,6 +2056,16 @@ bool common_speculative_load_draft_model(
 
     params.mparams_dft.path = params_dft.model;
 
+    // sp-server pre-loads MTP companion models once and reuses the pointer across every
+    // attach() call for a conversation (model_dft's own comment: "shared by multiple
+    // speculative contexts"). Everything above this point -- ncmoe/offload clears, the n_ctx
+    // fallback, n_parallel=1 -- still has to run so cparams_dft matches what a fresh load
+    // would have produced; only the disk read and tensor materialization are skippable.
+    if (params.model_dft != nullptr) {
+        params.cparams_dft = common_context_params_to_llama(params_dft);
+        return true;
+    }
+
     llama_model_params mparams_dft = common_model_params_to_llama(params_dft);
     llama_model * loaded_model = llama_model_load_from_file(params_dft.model.c_str(), mparams_dft);
     if (loaded_model == nullptr) {
