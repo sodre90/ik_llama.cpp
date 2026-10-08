@@ -676,24 +676,38 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
     //    else if (nth%4 == 0 && neq1%4 == 0 && work_per_slice >= (1 << 21)) ntg = 4;
     //    else if (nth%2 == 0 && neq1%2 == 0 && work_per_slice >= (1 << 19)) ntg = 2;
     //}
+    // Under a causal mask a later query row attends to more keys, so handing each of a head's ntg
+    // threads one contiguous slice of rows leaves the early slice's thread waiting on the late one
+    // (1.7x the work on odd threads in gemma-4 prefill). With enough rows, cut 2*ntg slices instead
+    // and give thread j slices j and 2*ntg-1-j, one early and one late. Slices stay multiples of
+    // kZigzagRows so each still runs the widest q_step kernel.
+    constexpr int kZigzagRows = 64;
+    const bool zigzag = ntg > 1 && mask && neq1 >= 2*ntg*kZigzagRows;
+    const int nslice = zigzag ? 2*ntg : ntg;
+    const int slice_rows = zigzag ? kZigzagRows*((neq1 + nslice*kZigzagRows - 1)/(nslice*kZigzagRows)) : neq1g;
+
+    auto attend_rows = [&](int64_t iq2, int64_t iq3, int slice) {
+        const int iq1 = slice*slice_rows;
+        const int this_neq1 = std::min(slice_rows, neq1 - iq1);
+        if (this_neq1 <= 0) return true;
+        return iqk_flash_attn_impl(int_type_k, int_type_v,
+                Dk, Dv, this_neq1, nek1, stride_q, stride_k, stride_v, stride_m, ne1*nb1/sizeof(float),
+                (const float *)((const char *)q + iq2*nbq2 + iq3*nbq3 + int64_t(iq1)*stride_q),
+                (const void  *)((const char *)k + iq2/rk2*nbk2 + iq3/rk3*nbk3),
+                (const void  *)((const char *)v + iq2/rv2*nbv2 + iq3/rv3*nbv3),
+                mask ? (const void  *)((const char *)mask + int64_t(iq1)*stride_m) : nullptr,
+                sinks ? (const float *)sinks + iq2 : nullptr, 0,
+                scale, softcap,
+                (float *)((char *)qkv + (iq3*ne2*ne1 + iq2 + int64_t(iq1)*ne1)*nb1), nullptr, nullptr);
+    };
+
     int counter = 0;
     for (int64_t iq3 = 0; iq3 < neq3; iq3++) {
         for (int64_t iq2 = 0; iq2 < neq2; iq2++) {
-            auto sinksf = sinks ? (const float *)sinks + iq2 : nullptr;
-            if (counter++ % (nth/ntg) == ith/ntg) {
-                int iq1 = (ith%ntg)*neq1g;
-                int this_neq1 = std::min(neq1g, neq1-iq1);
-                if (this_neq1 > 0) {
-                if (!iqk_flash_attn_impl(int_type_k, int_type_v,
-                        Dk, Dv, this_neq1, nek1, stride_q, stride_k, stride_v, stride_m, ne1*nb1/sizeof(float),
-                        (const float *)((const char *)q + iq2*nbq2 + iq3*nbq3 + int64_t(iq1)*stride_q),
-                        (const void  *)((const char *)k + iq2/rk2*nbk2 + iq3/rk3*nbk3),
-                        (const void  *)((const char *)v + iq2/rv2*nbv2 + iq3/rv3*nbv3),
-                        mask ? (const void  *)((const char *)mask + int64_t(iq1)*stride_m) : nullptr, sinksf, 0,
-                        scale, softcap,
-                        (float *)((char *)qkv + (iq3*ne2*ne1 + iq2 + iq1*ne1)*nb1), nullptr, nullptr)) return false;
-                }
-            }
+            if (counter++ % (nth/ntg) != ith/ntg) continue;
+            const int j = ith%ntg;
+            if (!attend_rows(iq2, iq3, j)) return false;
+            if (zigzag && !attend_rows(iq2, iq3, nslice - 1 - j)) return false;
         }
     }
 
