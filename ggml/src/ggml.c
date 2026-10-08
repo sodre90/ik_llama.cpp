@@ -17804,31 +17804,33 @@ static void ggml_compute_forward_rms_norm_f32(
 
     GGML_ASSERT(eps > 0.0f);
 
-    // TODO: optimize
-    for (int64_t i03 = 0; i03 < ne03; i03++) {
-        for (int64_t i02 = 0; i02 < ne02; i02++) {
-            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
-                const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+    // Rows are split across all of dims 1-3: a [n_embd, n_groups, n_tokens] input has only
+    // n_groups rows in dim 1, and splitting that dim alone left all but n_groups threads idle.
+    const int64_t nrows = ne01*ne02*ne03;
+    const int64_t nrows_per_thread = (nrows + nth - 1)/nth;
+    const int64_t first = ith*nrows_per_thread;
+    const int64_t last  = MIN(nrows, first + nrows_per_thread);
 
-                ggml_float sum = 0.0;
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
-                }
+    for (int64_t ir = first; ir < last; ++ir) {
+        const int64_t i03 = ir/(ne01*ne02);
+        const int64_t i02 = (ir - i03*ne01*ne02)/ne01;
+        const int64_t i01 = ir - i03*ne01*ne02 - i02*ne01;
+        const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
-                const float mean = sum/ne00;
-
-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
-
-                memcpy(y, x, ne00 * sizeof(float));
-                // for (int i00 = 0; i00 < ne00; i00++) {
-                //     y[i00] = x[i00];
-                // }
-
-                const float scale = 1.0f/sqrtf(mean + eps);
-
-                ggml_vec_scale_f32(ne00, y, scale);
-            }
+        ggml_float sum = 0.0;
+        for (int64_t i00 = 0; i00 < ne00; i00++) {
+            sum += (ggml_float)(x[i00] * x[i00]);
         }
+
+        const float mean = sum/ne00;
+
+        float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+
+        memcpy(y, x, ne00 * sizeof(float));
+
+        const float scale = 1.0f/sqrtf(mean + eps);
+
+        ggml_vec_scale_f32(ne00, y, scale);
     }
 }
 
